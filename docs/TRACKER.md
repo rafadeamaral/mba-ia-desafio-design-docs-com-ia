@@ -8,6 +8,8 @@ Mapeia cada item registrado no pacote de documentação à sua origem — um tre
 - `TRANSCRICAO` — localização no formato `[hh:mm] Nome`, referente à fala que originou o item.
 - `CODIGO` — caminho de arquivo real do repositório.
 
+**O que conta como "item identificável".** Cada requisito funcional e não funcional, decisão, alternativa descartada, questão em aberto, restrição, trade-off, contrato de endpoint, código de erro, ponto de integração com o código, dependência e risco registrado nos documentos. **Não** são contados separadamente: critérios de aceitação (PRD §11 e FDD §13), que são reformulações verificáveis de requisitos já rastreados nesta tabela; textos de contexto e seções de método. Decisões de implementação sem origem na reunião — como o `batchSize` default ou o limiar de recuperação de eventos travados — estão sinalizadas como tal no próprio FDD e por isso não aparecem aqui: elas não afirmam origem que não têm.
+
 **Cobertura:** 228 itens rastreados — 182 (80%) com origem na transcrição, 46 (20%) com origem no código. As 85 referências distintas a falas da reunião foram verificadas contra o texto de `TRANSCRICAO.md`, e todos os caminhos de arquivo foram verificados contra o repositório.
 
 ---

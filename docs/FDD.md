@@ -102,11 +102,12 @@ model WebhookOutboxEvent {
   nextAttemptAt DateTime           @default(now())
   lastError     String?            @db.VarChar(500)
   createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt           // recuperação de PROCESSING travado (5.2)
   deliveredAt   DateTime?
 
   endpoint WebhookEndpoint @relation(fields: [endpointId], references: [id])
 
-  @@index([status, nextAttemptAt])   // query principal do worker
+  @@index([status, attempts, nextAttemptAt])   // query principal do worker (5.2)
   @@index([createdAt])
   @@index([orderId])
   @@map("webhook_outbox")
@@ -152,7 +153,7 @@ model WebhookDeadLetter {
 **Notas de modelagem:**
 
 - Os quatro estados da outbox são exatamente os que Diego nomeou (`[09:08]`): *"pendente, processando, falhou, entregue"*.
-- O índice composto `(status, nextAttemptAt)` atende diretamente a query do worker; Diego previu índice em status e em `created_at` (`[09:08]`), e `nextAttemptAt` entra porque o backoff exige filtro temporal.
+- O índice composto `(status, attempts, nextAttemptAt)` atende diretamente a query do worker (seção 5.2); Diego previu índice em status e em `created_at` (`[09:08]`), e `nextAttemptAt` e `attempts` entram porque o backoff exige filtro temporal e o teto de tentativas precisa excluir os eventos já enviados para a DLQ.
 - **Uma linha de outbox por endpoint interessado.** Se dois webhooks do mesmo customer escutam `SHIPPED`, a mudança gera duas linhas, com dois `X-Event-Id` distintos. Isso mantém `X-Event-Id` único por entrega lógica e viabiliza a dedup do cliente.
 - `previousSecret` + `previousSecretExpiresAt` implementam o grace period de 24h ([ADR-004](adrs/ADR-004-hmac-sha256-com-secret-por-endpoint.md)).
 
@@ -199,7 +200,9 @@ src/worker.ts  (npm run worker)
     └── loop infinito, ciclo de 2s ............................... [09:09] Diego
         │
         ├─ 1. SELECT * FROM webhook_outbox
-        │       WHERE status IN ('PENDING','FAILED') AND nextAttemptAt <= NOW()
+        │       WHERE status IN ('PENDING','FAILED')
+        │         AND attempts < <maxAttempts>        ← ver nota abaixo
+        │         AND nextAttemptAt <= NOW()
         │       ORDER BY createdAt ASC
         │       LIMIT <batchSize>                     ← batch pequeno [09:08]
         │
@@ -208,8 +211,10 @@ src/worker.ts  (npm run worker)
         ├─ 3. para cada evento, sequencialmente (single-worker preserva
         │      ordering por order_id) ............................. [09:12] Diego
         │      │
-        │      ├─ carrega o endpoint; inativo? → marca DELIVERED=false e descarta
-        │      │    com log WEBHOOK_ENDPOINT_INACTIVE (não consome tentativa)
+        │      ├─ carrega o endpoint; inativo? → não envia: registra
+        │      │    lastError=WEBHOOK_ENDPOINT_INACTIVE, devolve a linha para
+        │      │    PENDING com nextAttemptAt = now()+1h e NÃO incrementa
+        │      │    attempts (o endpoint pode ser reativado; ver 6.3)
         │      ├─ assina: HMAC-SHA256(payload, endpoint.secret) ..... ADR-004
         │      ├─ POST na url com os headers da seção 7, timeout 10s . [09:42] Diego
         │      ├─ grava WebhookDeliveryAttempt (status, body truncado, durationMs)
@@ -222,7 +227,9 @@ src/worker.ts  (npm run worker)
 
 O worker **não consulta as tabelas de domínio**. Ele lê a outbox e envia o `payload` gravado, consequência direta de [ADR-007](adrs/ADR-007-snapshot-do-payload-na-outbox.md).
 
-**Recuperação de eventos travados em `PROCESSING`:** se o processo morrer entre o passo 2 e o 3, linhas ficam presas. O worker, no startup, promove de volta para `PENDING` toda linha em `PROCESSING` com `updatedAt` anterior a um limiar (sugestão: 5 minutos). Isso é seguro porque a entrega é at-least-once ([ADR-005](adrs/ADR-005-at-least-once-com-x-event-id.md)) — no pior caso o cliente recebe duplicado e deduplica pelo `X-Event-Id`.
+> **Por que a query precisa do `attempts < maxAttempts`.** A reunião definiu quatro estados para a outbox — *"pendente, processando, falhou, entregue"* (`[09:08] Diego`) — e não um estado terminal de falha permanente. Como um evento que foi para a DLQ (seção 5.4) permanece com `status = 'FAILED'` e `nextAttemptAt` no passado, sem esse predicado ele seria reselecionado a cada ciclo, para sempre. O contador de tentativas é o que separa "falhou e vai tentar de novo" de "falhou em definitivo". A alternativa seria acrescentar um quinto estado ao enum, o que se afastaria do vocabulário que o time fechou.
+
+**Recuperação de eventos travados em `PROCESSING`:** se o processo morrer entre o passo 2 e o 3, linhas ficam presas. O worker, no startup, promove de volta para `PENDING` toda linha em `PROCESSING` com `updatedAt` anterior a um limiar (sugestão: 5 minutos — valor de implementação, sem origem na reunião). Isso é seguro porque a entrega é at-least-once ([ADR-005](adrs/ADR-005-at-least-once-com-x-event-id.md)) — no pior caso o cliente recebe duplicado e deduplica pelo `X-Event-Id`.
 
 ### 5.3 Retry
 
@@ -263,21 +270,27 @@ O agendamento é **por registro**, via `nextAttemptAt`. O worker nunca bloqueia 
 └─ transação:
      ├─ INSERT webhook_dead_letter (originalEventId, endpointId, payload,
      │                              failureReason, attempts=5)
-     └─ UPDATE webhook_outbox SET status='FAILED'   ← permanece como trilha
-                                                       histórica, fora da
-                                                       janela de seleção
+     └─ UPDATE webhook_outbox SET status='FAILED', attempts=5
+              ← a linha PERMANECE na outbox como trilha histórica; sai da
+                janela de seleção do worker porque a query exige
+                attempts < maxAttempts (ver 5.2)
 
 POST /api/v1/admin/webhooks/dead-letter/:id/replay   (requireRole('ADMIN'))
 │
 └─ transação:
      ├─ valida: DLQ existe e replayedAt IS NULL (senão WEBHOOK_ALREADY_REPLAYED)
-     ├─ INSERT webhook_outbox com id = originalEventId  ← X-Event-Id preservado,
-     │      status='PENDING', attempts=0, nextAttemptAt=now()          ADR-005
+     ├─ UPDATE webhook_outbox                        ← a linha original é
+     │      WHERE id = originalEventId                  REUTILIZADA, não
+     │      SET status='PENDING', attempts=0,           recriada: o id é a PK
+     │          nextAttemptAt=now(), lastError=NULL     e já existe
+     │                                                            ADR-005
      └─ UPDATE webhook_dead_letter SET replayedAt=now(), replayedById=req.user.id
                                                             auditoria [09:36] Sofia
 ```
 
-O `originalEventId` é reutilizado deliberadamente: um cliente que já havia recebido e processado aquele evento antes de a resposta se perder consegue deduplicar o replay pelo mesmo `X-Event-Id`.
+**Por que reaproveitar a linha em vez de inserir outra.** O `id` da linha da outbox **é** o `X-Event-Id` ([ADR-005](adrs/ADR-005-at-least-once-com-x-event-id.md)), e ele precisa ser preservado no replay para que a deduplicação do cliente funcione — um cliente que já havia recebido e processado aquele evento antes de a resposta se perder reconhece o reenvio pelo mesmo identificador. Como `id` é chave primária, inserir uma segunda linha com o mesmo valor colidiria; o replay portanto **atualiza a linha existente**, zerando o contador de tentativas e recolocando-a na janela de seleção do worker.
+
+Efeito colateral aceito: o histórico de tentativas em `webhook_delivery_attempts` continua apontando para o mesmo `eventId`, então as tentativas do ciclo original e as do replay convivem na mesma listagem de `GET /webhooks/:id/deliveries`, distinguíveis por `attemptedAt` e por `attemptNumber` reiniciado.
 
 ## 6. Contratos públicos
 
@@ -338,6 +351,15 @@ Content-Type: application/json
 
 Pedido por Bruno (`[09:33]`): *"GET pra listar os webhooks de um customer"*.
 
+**Request**
+
+```http
+GET /api/v1/webhooks?customerId=8f14e45f-ceea-467a-9f4f-1e2b3c4d5e6f&page=1&pageSize=20
+Authorization: Bearer <jwt>
+```
+
+Sem corpo. `customerId` é obrigatório; `page` e `pageSize` são opcionais.
+
 **Response `200 OK`** — mesmo formato paginado de `src/shared/http/response.ts`, usado hoje por `OrderService.list`:
 
 ```json
@@ -360,15 +382,42 @@ Pedido por Bruno (`[09:33]`): *"GET pra listar os webhooks de um customer"*.
 
 **Semântica.** O campo `secret` **nunca** aparece em listagem ou consulta. Query params `page` e `pageSize` seguem os defaults de `listOrdersQuerySchema` (`src/modules/orders/order.schemas.ts:23`): 1 e 20, com teto de 100.
 
+| Status | Quando |
+| --- | --- |
+| `200` | Listagem retornada (array vazio se o customer não tiver webhooks) |
+| `400` | `VALIDATION_ERROR` — `customerId` ausente ou não-UUID, `pageSize` acima de 100 |
+| `401` | Sem token válido |
+
 ### 6.3 `PATCH /api/v1/webhooks/:id` — editar webhook
 
 **Request**
 
+```http
+PATCH /api/v1/webhooks/3b241101-e2bb-4255-8caf-4136c566a962
+Authorization: Bearer <jwt>
+Content-Type: application/json
+```
 ```json
-{ "subscribedStatuses": ["PAID", "SHIPPED", "DELIVERED"], "active": false }
+{
+  "subscribedStatuses": ["PAID", "SHIPPED", "DELIVERED"],
+  "active": false
+}
 ```
 
-**Response `200 OK`** — o recurso atualizado, no mesmo formato de 6.2.
+**Response `200 OK`**
+
+```json
+{
+  "id": "3b241101-e2bb-4255-8caf-4136c566a962",
+  "customerId": "8f14e45f-ceea-467a-9f4f-1e2b3c4d5e6f",
+  "url": "https://api.atlascomercial.com.br/integracoes/oms/webhook",
+  "subscribedStatuses": ["PAID", "SHIPPED", "DELIVERED"],
+  "active": false,
+  "secretRotatedAt": null,
+  "createdAt": "2026-08-13T14:02:11.000Z",
+  "updatedAt": "2026-08-13T16:25:40.000Z"
+}
+```
 
 **Semântica.** Campos aceitos: `url`, `subscribedStatuses`, `active`. A `secret` **não** é editável por aqui — rotação tem endpoint próprio (6.5). Desativar (`active: false`) interrompe novas inserções na outbox, mas **não** cancela eventos já enfileirados.
 
@@ -380,13 +429,43 @@ Pedido por Bruno (`[09:33]`): *"GET pra listar os webhooks de um customer"*.
 
 ### 6.4 `DELETE /api/v1/webhooks/:id` — remover webhook
 
-**Response `204 No Content`**, sem corpo — mesmo padrão de `OrderController.delete` (`src/modules/orders/order.controller.ts:48`).
+**Request**
 
-**Semântica.** Remoção lógica: o registro é marcado como removido e para de receber eventos, mas o histórico de entregas e as linhas de DLQ associadas são preservados. Erro `404 WEBHOOK_NOT_FOUND` se não existir.
+```http
+DELETE /api/v1/webhooks/3b241101-e2bb-4255-8caf-4136c566a962
+Authorization: Bearer <jwt>
+```
+
+Sem corpo.
+
+**Response `204 No Content`**
+
+```
+(sem corpo)
+```
+
+Mesmo padrão de `OrderController.delete` (`src/modules/orders/order.controller.ts:48`), que responde `res.status(204).send()`.
+
+**Semântica.** Remoção lógica: o registro é marcado como removido e para de receber eventos, mas o histórico de entregas e as linhas de DLQ associadas são preservados.
+
+| Status | Quando |
+| --- | --- |
+| `204` | Removido |
+| `401` | Sem token válido |
+| `404` | `WEBHOOK_NOT_FOUND` |
 
 ### 6.5 `POST /api/v1/webhooks/:id/rotate-secret` — rotacionar a secret
 
 Decidido por Sofia (`[09:21]`): *"Endpoint pro cliente conseguir pedir nova secret pela API."*
+
+**Request**
+
+```http
+POST /api/v1/webhooks/3b241101-e2bb-4255-8caf-4136c566a962/rotate-secret
+Authorization: Bearer <jwt>
+```
+
+Sem corpo — a nova secret é gerada pela plataforma, não enviada pelo cliente (`[09:31] Marcos`).
 
 **Response `200 OK`**
 
@@ -410,6 +489,15 @@ Decidido por Sofia (`[09:21]`): *"Endpoint pro cliente conseguir pedir nova secr
 ### 6.6 `GET /api/v1/webhooks/:id/deliveries` — histórico de entregas
 
 Pedido por Marcos (`[09:34]`): *"esses são os últimos 100 webhooks que vocês mandaram pra mim, sucesso/falha, payload, response, tempo de resposta"*.
+
+**Request**
+
+```http
+GET /api/v1/webhooks/3b241101-e2bb-4255-8caf-4136c566a962/deliveries?page=1&pageSize=100
+Authorization: Bearer <jwt>
+```
+
+Sem corpo.
 
 **Response `200 OK`**
 
@@ -439,11 +527,27 @@ Pedido por Marcos (`[09:34]`): *"esses são os últimos 100 webhooks que vocês 
 }
 ```
 
-**Semântica.** Ordenado por `attemptedAt` decrescente. `pageSize` default 100, alinhado ao pedido de Marcos. `responseBody` é truncado no armazenamento para não inflar a tabela. Uma tentativa que estourou timeout tem `responseStatus: null` e `error` preenchido. Retorna `404 WEBHOOK_NOT_FOUND` se o webhook não existir.
+**Semântica.** Ordenado por `attemptedAt` decrescente. `pageSize` default 100, alinhado ao pedido de Marcos. `responseBody` é truncado no armazenamento para não inflar a tabela. Uma tentativa que estourou timeout tem `responseStatus: null` e `error` preenchido.
+
+| Status | Quando |
+| --- | --- |
+| `200` | Histórico retornado (array vazio se nunca houve tentativa) |
+| `400` | `VALIDATION_ERROR` — `id` não-UUID ou `pageSize` acima do teto |
+| `401` | Sem token válido |
+| `404` | `WEBHOOK_NOT_FOUND` |
 
 ### 6.7 `POST /api/v1/admin/webhooks/dead-letter/:id/replay` — reprocessar da DLQ
 
 Endpoint exatamente como Diego nomeou (`[09:35]`). **Exige role `ADMIN`**, via `requireRole('ADMIN')` (`src/middlewares/auth.middleware.ts:49`), no mesmo padrão de `src/modules/users/user.routes.ts:15`.
+
+**Request**
+
+```http
+POST /api/v1/admin/webhooks/dead-letter/f47ac10b-58cc-4372-a567-0e02b2c3d479/replay
+Authorization: Bearer <jwt-de-um-usuario-ADMIN>
+```
+
+Sem corpo — o `:id` do path identifica o registro de DLQ, e o autor sai de `req.user.id`.
 
 **Response `202 Accepted`**
 
@@ -759,7 +863,9 @@ WEBHOOK_MAX_ATTEMPTS:      z.coerce.number().int().positive().default(5),
 WEBHOOK_MAX_PAYLOAD_BYTES: z.coerce.number().int().positive().default(65536),
 ```
 
-Os defaults reproduzem os valores decididos na reunião. `DATABASE_URL` é compartilhada entre API e worker (`[09:30] Bruno`).
+Quatro dos cinco defaults reproduzem valores decididos na reunião: 2000ms (`[09:09] Diego`), 10000ms (`[09:42] Diego`), 5 tentativas (`[09:15] Diego`) e 65536 bytes (`[09:24] Diego`). **`WEBHOOK_BATCH_SIZE` é a exceção**: a reunião só definiu *"batch pequeno"* (`[09:08] Diego`), sem número. O valor 20 é uma proposta de implementação e deve ser calibrado com o volume real — por isso é configurável.
+
+`DATABASE_URL` é compartilhada entre API e worker (`[09:30] Bruno`).
 
 ### Compatibilidade
 
@@ -784,7 +890,8 @@ Os defaults reproduzem os valores decididos na reunião. `DATABASE_URL` é compa
 | CAT-09 | URL `http://` é recusada com `WEBHOOK_INVALID_URL` / 400 | Teste de contrato via Supertest |
 | CAT-10 | Payload acima de 64KB gera `WEBHOOK_PAYLOAD_TOO_LARGE` e não é enviado | Teste com payload artificialmente inflado |
 | CAT-11 | Replay de DLQ com role `OPERATOR` retorna 403 `FORBIDDEN` | Teste de contrato com JWT de operador |
-| CAT-12 | Replay preserva o `X-Event-Id` original | Teste comparando o `eventId` da DLQ com o da nova linha de outbox |
+| CAT-12 | Replay preserva o `X-Event-Id` original e não duplica a linha da outbox | Teste verificando que a linha de `originalEventId` voltou a `PENDING` com `attempts = 0`, e que a contagem de linhas em `webhook_outbox` não aumentou |
+| CAT-19 | Evento na DLQ não é reselecionado pelo worker | Teste com linha `FAILED`/`attempts = 5` e `nextAttemptAt` no passado: nenhum envio após vários ciclos |
 | CAT-13 | Replay grava `replayedById` com o usuário autenticado | Asserção sobre a linha de DLQ pós-replay |
 | CAT-14 | Todo erro `WEBHOOK_*` retorna o envelope `{ error: { code, message } }` | Testes de contrato cobrindo cada código da seção 8 |
 | CAT-15 | `secret` nunca aparece em `GET /webhooks`, `PATCH` ou em log | Asserção sobre corpo de resposta e sobre a saída do logger com `redactPaths` estendido |
@@ -801,7 +908,7 @@ Os defaults reproduzem os valores decididos na reunião. `DATABASE_URL` é compa
 | RT-03 | Um cliente lento monopoliza o worker e atrasa os demais | Média | Médio | Timeout de 10s limita o dano por evento; instrumentar `webhook_delivery_duration_seconds` por endpoint; relacionado a Q1 do [RFC](RFC.md#5-questões-em-aberto) |
 | RT-04 | Worker cai e ninguém percebe até o cliente reclamar | Média | Alto | `webhook_outbox_oldest_pending_age_seconds` com alarme acima de 60s (seção 10) |
 | RT-05 | Serialização não determinística quebra a assinatura entre tentativas | Baixa | Alto | Armazenar e enviar a mesma string; CAT-18 cobre |
-| RT-06 | Outbox cresce sem limite e degrada a query do worker | Alta (longo prazo) | Médio | Índice `(status, nextAttemptAt)`; retenção é Q3 do [RFC](RFC.md#5-questões-em-aberto), com dono e prazo |
+| RT-06 | Outbox cresce sem limite e degrada a query do worker | Alta (longo prazo) | Médio | Índice `(status, attempts, nextAttemptAt)`; retenção é Q3 do [RFC](RFC.md#5-questões-em-aberto), com dono e prazo |
 | RT-07 | Cliente não implementa dedup e processa eventos duplicados | Média | Médio | Documentação destacada no portal, assumida por Marcos (`[09:26]`); `X-Event-Id` em header e no corpo |
 | RT-08 | Revisão de segurança atrasa o deploy no fim do cronograma | Média | Médio | Reservar os dois dias úteis de Sofia dentro da terceira sprint (`[09:46]`), não depois dela |
 | RT-09 | Evento fica preso em `PROCESSING` após crash do worker | Baixa | Médio | Recuperação no startup (seção 5.2), segura porque a entrega é at-least-once; CAT-17 cobre |
