@@ -222,3 +222,91 @@ O primeiro validou as 85 referências distintas a falas — todas conferem. O se
 - **Quero ver o que a reunião rejeitou:** [RFC §4](docs/RFC.md#4-alternativas-consideradas) para as alternativas descartadas, [PRD §5.2](docs/PRD.md#52-fora-de-escopo) para o que ficou fora.
 - **Quero ver o que ainda está indefinido:** [RFC §5](docs/RFC.md#5-questões-em-aberto).
 - **Quero conferir se algo foi inventado:** [`docs/TRACKER.md`](docs/TRACKER.md) — 228 itens, cada um com timestamp ou caminho de arquivo.
+
+## Validação contra os critérios de aceite
+
+O enunciado original está preservado em [`docs/ENUNCIADO.md`](docs/ENUNCIADO.md) **sem alterações**, inclusive com as caixas de seleção vazias — ele é a referência do que foi pedido, não o registro do que foi feito. Este é o registro.
+
+### PRD — [`docs/PRD.md`](docs/PRD.md)
+
+- [x] Arquivo existe e está em Markdown
+- [x] Contém todas as seções obrigatórias do requisito 1 — **12 de 12**
+- [x] Identifica no mínimo 8 requisitos funcionais — **15** (RF-01 a RF-15)
+- [x] Pelo menos 1 objetivo com métrica e meta quantitativa — **6** (OBJ-01: latência p95 < 10s; OBJ-02: queda ≥ 80% no polling; OBJ-06: DLQ < 1%/mês)
+- [x] "Fora de escopo" com pelo menos 2 itens descartados ou adiados — **7** (FE-01 a FE-07)
+- [x] "Riscos" com pelo menos 2 riscos com probabilidade, impacto e mitigação — **7** (R-01 a R-07)
+
+### RFC — [`docs/RFC.md`](docs/RFC.md)
+
+- [x] Arquivo existe e está em Markdown
+- [x] Contém todas as seções obrigatórias do requisito 2 — **8**, mais os metadados no cabeçalho
+- [x] "Alternativas consideradas" com pelo menos 2 descartadas, cada uma com o trade-off — **6**
+- [x] "Questões em aberto" com pelo menos 2 pontos adiados ou não decididos — **5** (Q1 a Q5)
+- [x] Referencia com link pelo menos 2 ADRs — **7**
+- [x] Conciso, 2 a 4 páginas — **2.242 palavras**
+
+### FDD — [`docs/FDD.md`](docs/FDD.md)
+
+- [x] Arquivo existe e está em Markdown
+- [x] Contém todas as seções obrigatórias do requisito 3 — **14 de 14**
+- [x] "Contratos públicos" com pelo menos 4 endpoints HTTP com payload de exemplo (request e response) e status codes — **7 de 7 endpoints completos**
+- [x] Matriz de erros com prefixo `WEBHOOK_` — **19 códigos**
+- [x] "Integração com o sistema existente" referencia pelo menos 4 caminhos de arquivo reais — **16 arquivos existentes**, em 12 pontos de integração
+- [x] "Observabilidade" cita métricas, logs e tracing — as três subseções
+
+### ADRs — [`docs/adrs/`](docs/adrs/)
+
+- [x] Entre 5 e 8 arquivos no formato `ADR-NNN-titulo-em-kebab-case.md` — **7**
+- [x] Cada ADR com Status, Contexto, Decisão, Alternativas Consideradas, Consequências — **7 de 7**
+- [x] Cobre pelo menos 5 das 6 decisões principais — **as 6**, mais o snapshot do payload (ADR-007)
+- [x] Pelo menos 1 ADR referencia arquivos, módulos ou classes do código base — **6 dos 7**; o [ADR-006](docs/adrs/ADR-006-reuso-dos-padroes-do-projeto.md) é integralmente sobre isso
+
+### Tracker — [`docs/TRACKER.md`](docs/TRACKER.md)
+
+- [x] Segue o formato de tabela do requisito 5 — colunas ID, Documento, Tipo, Conteúdo, Fonte, Localização
+- [x] Pelo menos 80% dos itens identificáveis têm linha correspondente — **228 itens**; o critério de contagem está declarado no topo do arquivo
+- [x] Pelo menos 70% das linhas com Fonte = `TRANSCRICAO` e timestamp válido — **80%** (182 linhas); as **85 referências distintas foram verificadas** contra `TRANSCRICAO.md`
+- [x] Pelo menos 5 linhas com Fonte = `CODIGO` e caminho real — **46**
+
+### README — [`README.md`](README.md)
+
+- [x] Contém todas as seções obrigatórias do requisito 6 — **6 de 6**
+- [x] Lista pelo menos 1 ferramenta de IA — **3**
+- [x] Mostra pelo menos 2 prompts customizados em blocos de código — **3**
+- [x] Descreve pelo menos 2 iterações ou ajustes concretos — **7**
+
+### Consistência geral
+
+- [x] Nenhum requisito, decisão ou restrição contradiz a transcrição ou o código
+- [x] Nenhum arquivo de código mencionado é inexistente no repositório — os 6 caminhos que ainda não existem são os arquivos **a criar** pela feature, identificados como tais na convenção de leitura do início da §11 do FDD
+- [x] Nenhuma alteração em `src/`, `prisma/`, `tests/` ou configurações
+
+### Como reproduzir a verificação
+
+Os itens que dependem de contagem ou de conferência contra as fontes foram checados por script, não a olho:
+
+```bash
+# 1. Toda referência [hh:mm] Nome do tracker existe na transcrição?
+grep -o '`\[09:[0-9][0-9]\] [A-Za-zí]*`' docs/TRACKER.md | tr -d '`' | sort -u \
+  | while read -r r; do grep -qF "$r" TRANSCRICAO.md || echo "FALTA: $r"; done
+
+# 2. Todo caminho de arquivo citado existe no repositório?
+grep -ohE '(src|prisma|tests)/[A-Za-z0-9._/-]+\.(ts|prisma)' docs/*.md docs/adrs/*.md \
+  | sort -u | while read -r p; do [ -f "$p" ] || echo "A CRIAR: $p"; done
+
+# 3. Cada endpoint do FDD tem request, response e tabela de status codes?
+for n in 1 2 3 4 5 6 7; do
+  sec=$(sed -n "/^### 6\.$n /,/^### 6\.$((n+1)) \|^## 7\./p" docs/FDD.md)
+  echo "6.$n -> Request=$(echo "$sec" | grep -c '\*\*Request\*\*')" \
+       "Response=$(echo "$sec" | grep -c '\*\*Response `')" \
+       "Status=$(echo "$sec" | grep -c '^| Status | Quando |')"
+done
+
+# 4. Nenhum link markdown interno quebrado?
+for f in README.md docs/*.md docs/adrs/*.md; do d=$(dirname "$f")
+  grep -oE '\]\(([^)#]+\.md)(#[^)]*)?\)' "$f" | sed -E 's/^\]\(//; s/\)$//; s/#.*$//' \
+    | sort -u | while read -r l; do [ -e "$d/$l" ] || echo "QUEBRADO: $f -> $l"; done
+done
+```
+
+Foi a rodada 3 desses scripts que revelou que apenas **1** dos 7 endpoints tinha request *e* response de exemplo, contra os 4 exigidos pelo critério. A correção está no commit `e51a744`.
